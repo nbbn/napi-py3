@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # original file by gim,krzynio,dosiu,hash 2oo8.
-# modified by github.com/nbbn
+# modified by Jakub Stepniak github.com/nbbn
 
 import hashlib, sys, urllib.request, os
 
@@ -23,7 +23,7 @@ def f(z):
     return ''.join(b)
 
 if (len(sys.argv) == 1):
-    print("wy*dalaj na stadion po film")
+    print("no movie")
     sys.exit(2)
 
 d = hashlib.md5();
@@ -31,17 +31,19 @@ d.update(open(sys.argv[1], mode='br').read(10485760))
 
 str = "http://napiprojekt.pl/unit_napisy/dl.php?l=PL&f=" + d.hexdigest() + "&t=" + f(
     d.hexdigest()) + "&v=other&kolejka=false&nick=&pass=&napios=" + os.name
-
-open("napisy.7z", "bw").write(urllib.request.urlopen(str).read())
+try:
+    open("napisy.7z", "bw").write(urllib.request.urlopen(str).read())
+except Exception:
+    print("no Internet connection")
+    exit()
 nazwa = sys.argv[1][:-3] + 'txt'
 
 if (os.system("/usr/bin/7z x -y -so -piBlm8NTigvru0Jr0 napisy.7z 2>/dev/null >\"" + nazwa + "\"")):
-    print("nie ma napisa do filmu")
+    print("no subtitles for movie")
     os.remove(nazwa)
 else:
-    print("napisy pobrano, milordzie!")
+    print("subtitles downloaded")
     lines = [line for line in open(nazwa, 'r', encoding='cp1250')]
     os.remove(nazwa)
     open(nazwa, 'w').writelines(lines)
 os.remove("napisy.7z")
-
