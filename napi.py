@@ -43,7 +43,10 @@ if (os.system("/usr/bin/7z x -y -so -piBlm8NTigvru0Jr0 napisy.7z 2>/dev/null >\"
     os.remove(nazwa)
 else:
     print("subtitles downloaded")
-    lines = [line for line in open(nazwa, 'r', encoding='cp1250')]
+    try:
+        lines = [line for line in open(nazwa, 'r', encoding='cp1250')]
+    except:
+        print('some errors in encoding')
     os.remove(nazwa)
     open(nazwa, 'w').writelines(lines)
 os.remove("napisy.7z")
