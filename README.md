@@ -1,7 +1,7 @@
 # napi.py-3
 Napi.py is a simple script that allows you to download subtitles for movies from NapiProjekt and OpenSubtitles.
 Check more with build-in help:
-````bash
+````
 $ napi.py -h
 usage: napi.py [-h] [-l LANGUAGE] [--selection] [-p PREFERRED] filename
 
