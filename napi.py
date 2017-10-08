@@ -368,7 +368,7 @@ class Subber:
     @staticmethod
     def exit_info():
         print(
-            'napi.py uses NapiProjekt Database (http://www.napiprojekt.pl/) and OpenSubtitles Database (https://www.opensubtitles.org/).')
+            '\nnapi.py (https://github.com/nbbn/napi-py3) uses NapiProjekt Database (http://www.napiprojekt.pl/) and OpenSubtitles Database (https://www.opensubtitles.org/).')
 
 
 if __name__ == '__main__':
