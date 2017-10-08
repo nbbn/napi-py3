@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# original file by gim,krzynio,dosiu,hash 2oo8.
-# modified by Jakub Stepniak github.com/nbbn
+# Jakub Stepniak github.com/nbbn
 
 import urllib.request
 import urllib.error
@@ -11,6 +10,213 @@ import struct
 import xmlrpc.client
 import time
 import zipfile
+import sys
+import atexit
+
+
+class SubtitleService:
+    def download_subtitle(self, movie_id: str) -> bytes:
+        raise NotImplementedError
+
+    def list_available_subtitles(self) -> list:
+        raise NotImplementedError
+
+    @staticmethod
+    def reformat_subtitle(sub: bytes) -> str:
+        try:
+            sub = sub.decode('cp1250')
+        except UnicodeDecodeError:
+            sub = sub.decode('utf-8', 'replace')
+        return sub
+
+    @staticmethod
+    def save_subtitle_file(sub: str, path: str) -> None:
+        with open(path, 'w') as f:
+            f.write(sub)
+
+    def __init__(self, file_path: str, lang: str = 'pol') -> None:
+        """Using full path to movie file initiate local variables, connection to a service, hash."""
+
+        self.language = lang
+        self.file_path = file_path
+        self.filename = self.file_path.split('/')[-1].split('\\')[-1]
+        self.filename_wo_ext = '.'.join(self.file_path.split('/')[-1].split('\\')[-1].split('.')[:-1])
+        self.path = self.file_path[:-len(self.filename)]
+
+        self.subtitle_filename = '{}.txt'.format(self.filename_wo_ext)
+        self.subtitle_path = self.path + self.subtitle_filename
+        self.download_temp_path_m = '/tmp/napisy_mid'
+        self.subtitle_temp_path = '/tmp/{}'.format(self.subtitle_filename)
+
+    def __hash_function(self) -> str:
+        raise NotImplementedError
+
+
+class Napi(SubtitleService):
+    def __init__(self, file_path: str, lang: str = 'pol') -> None:
+        super().__init__(file_path, lang)
+        self.hash_digest = None
+        self.file_hash = self.__hash_function()
+
+    def __hash_function(self):
+        d = hashlib.md5()
+        with open(self.file_path, mode='br') as f:
+            d.update(f.read(10485760))
+        self.movie_id = d.hexdigest()
+        idx = [0xe, 0x3, 0x6, 0x8, 0x2]
+        mul = [2, 2, 5, 4, 3]
+        add = [0, 0xd, 0x10, 0xb, 0x5]
+
+        b = []
+        for i in range(len(idx)):
+            a = add[i]
+            m = mul[i]
+            i = idx[i]
+
+            t = a + int(self.movie_id[i], 16)
+            v = int(self.movie_id[t:t + 2], 16)
+            b.append(("%x" % (v * m))[-1])
+        return ''.join(b)
+
+    def list_available_subtitles(self):
+        try:
+            self.download_subtitle(self.movie_id)
+        except Exception:
+            return []
+        return [1]
+
+    def download_subtitle(self, movie_id: str = None) -> bytes:
+        if movie_id is None:
+            movie_id = self.movie_id
+        url = "http://napiprojekt.pl/unit_napisy/dl.php?l=PL&f={}&t={}&v=other&kolejka=false&nick=&pass=&napios={}" \
+            .format(movie_id, self.file_hash, os.name)
+        u = urllib.request.urlopen(url)
+        c = u.read()
+        code = u.getcode()
+        if code == 200 and c != b'NPc0':
+            open(self.download_temp_path_m, "bw").write(c)
+        else:
+            raise ValueError('No napiprojekt subtitle found.')
+
+        if os.system('/usr/bin/7z x -y -so -piBlm8NTigvru0Jr0 {} 2>/dev/null >"{}"'.format(
+          self.download_temp_path_m, self.subtitle_temp_path)) == 0:
+            os.remove(self.download_temp_path_m)
+        else:
+            raise EnvironmentError
+        with open(self.subtitle_temp_path, 'rb') as f:
+            c = f.read()
+        os.remove(self.subtitle_temp_path)
+        return c
+
+    def download_and_save(self, movie_id: str = None) -> None:
+        c = self.download_subtitle(movie_id)
+        self.save_subtitle_file(self.reformat_subtitle(c), self.subtitle_path)
+
+
+class Opensubtitle(SubtitleService):
+    def __init__(self, file_path: str, lang: str = 'pol') -> None:
+        super().__init__(file_path, lang)
+        self.connection_handler = None
+        self.token = None
+        self.connect()
+        self.file_hash = self.__hash_function()
+
+    def __hash_function(self):
+        l_format = '<q'  # little-endian long long
+        b_size = struct.calcsize(l_format)
+
+        with open(self.file_path, mode='br') as f:
+            f_size = os.path.getsize(self.file_path)
+            h = f_size
+
+            if f_size < 65536 * 2:
+                raise IOError('File to small.')
+
+            for x in range(65536 // b_size):
+                buffer = f.read(b_size)
+                (l_value,) = struct.unpack(l_format, buffer)
+                h += l_value
+                h = h & 0xFFFFFFFFFFFFFFFF  # to remain as 64bit number
+
+            f.seek(max(0, f_size - 65536), 0)
+            for x in range(65536 // b_size):
+                buffer = f.read(b_size)
+                (l_value,) = struct.unpack(l_format, buffer)
+                h += l_value
+                h = h & 0xFFFFFFFFFFFFFFFF
+
+            return "%016x" % h
+
+    def connect(self):
+        p = xmlrpc.client.ServerProxy('https://api.opensubtitles.org:443/xml-rpc')
+        a = p.LogIn('', '', '', 'SMPlayer v17.3.0')
+        if a['status'] == '200 OK':
+            self.token = a['token']
+            self.connection_handler = p
+        else:
+            raise EnvironmentError
+
+    def identify_movie(self) -> str:
+        a = self.connection_handler.CheckMovieHash2(self.token, [self.file_hash])
+        if a['status'] == '200 OK':
+            try:
+                a = a['data'][self.file_hash][0]
+            except TypeError:
+                raise Exception('No information about movie in database.')
+            if a['MovieKind'] == 'episode':
+                return '{} ({}) S{}E{}'.format(a['MovieName'], a['MovieYear'], a['SeriesSeason'], a['SeriesEpisode'])
+            else:
+                return '{} ({})'.format(a['MovieName'], a['MovieYear'])
+
+    def list_available_subtitles(self):
+        a = self.connection_handler.SearchSubtitles(self.token,
+                                                    [{'sublanguageid': self.language, 'moviehash': self.file_hash}])
+        if a['status'] == '200 OK':
+            return a['data']
+        else:
+            raise EnvironmentError
+
+    def download_subtitle(self, movie_id: str = None) -> bytes:
+        if movie_id is None:
+            l = self.list_available_subtitles()
+            m = time.strptime('1900-01-01 01:01:01', '%Y-%m-%d %H:%M:%S')
+            sub_item = None
+            for i in l:
+                t = time.strptime(i['SubAddDate'], '%Y-%m-%d %H:%M:%S')
+                if t > m:
+                    m = t
+                    sub_item = i
+            url = sub_item['ZipDownloadLink']
+            movie_id = url
+        # print(movie_id)
+        u = urllib.request.urlopen(movie_id)
+        c = u.read()
+        code = u.getcode()
+        if code == 200:
+            open(self.download_temp_path_m, "bw").write(c)
+            with zipfile.ZipFile(self.download_temp_path_m) as myzip:
+                m_size = 0
+                n = None
+                for i in myzip.filelist:
+                    if i.file_size > m_size:
+                        n = i.filename
+                        m_size = i.file_size
+                in_zip_filename = n
+                # print(in_zip_filename)
+                with myzip.open(in_zip_filename) as f:
+                    c = f.read()
+        else:
+            raise EnvironmentError
+        os.remove(self.download_temp_path_m)
+        return c
+
+    def download_and_save(self, movie_id: str = None) -> None:
+        c = self.download_subtitle(movie_id)
+        self.save_subtitle_file(self.reformat_subtitle(c), self.subtitle_path)
+
+    def disconnect(self):
+        self.connection_handler.LogOut(self.token)
+
 
 class Subber:
     languages = ['all', 'tha', 'afr', 'alb', 'ara', 'arm', 'ast', 'aze', 'baq', 'bel', 'ben', 'bos', 'bre', 'bul',
@@ -31,40 +237,22 @@ class Subber:
         parser.add_argument('--selection', action='store_true',
                             help='shows list of available subtitles and allows to select version to download')
         parser.add_argument('-p', '--preferred',
-                            help='preferred service (available options: napi, opensubtitles). Default: napi',
-                            type=self.__parse_preferred, default='napi')
-        # todo: prepare logger
-        args = parser.parse_args()
+                            help='preferred service (available options: napi, opensubtitles). Works only in selection mode. Default: opensubtitles.',
+                            type=self.__parse_preferred, default='opensubtitles')
 
-        self.selection = args.selection
-        self.language = args.language
-        self.filename = args.filename
-        self.preferred = args.preferred
+        self.__args = parser.parse_args()
+        # print(self.__args)
 
-        self.filename_wo_path = self.filename.split('/')[-1].split('\\')[-1]
-        self.filename_wo_path_and_ext = '.'.join(self.filename.split('/')[-1].split('\\')[-1].split('.')[:-1])
-        self.filename_path = self.filename[:-len(self.filename_wo_path)]
-
-        self.subtitle_filename = '{}.txt'.format(self.filename_wo_path_and_ext)
-        self.subtitle_path = self.filename_path + self.subtitle_filename
-        self.temp_file = '/tmp/napisy.7z'
-        self.subtitle_temp_path = '/tmp/{}'.format(self.subtitle_filename)
+        self.selection = self.__args.selection
+        self.language = self.__args.language
+        self.filename = self.__args.filename
+        self.preferred = self.__args.preferred
         try:
-            self.__init_opensubtitles()
-        except EnvironmentError as e:
-            self.os_proxy = False
-            print(str(e))
-
-    def __init_opensubtitles(self):
-        self.os_h = self.__opensubtitles_hash()
-        if not isinstance(self.os_h, str):
-            return str(self.os_h)
-        self.os_proxy = xmlrpc.client.ServerProxy('https://api.opensubtitles.org:443/xml-rpc')
-        a = self.os_proxy.LogIn('', '', '', 'SMPlayer v17.3.0')
-        if a['status'] == '200 OK':
-            self.opensubtitle_token = a['token']
-        else:
-            raise EnvironmentError('Opensubtitles server not available.')
+            with open(self.filename) as f:
+                if f.readable() is False:
+                    raise EnvironmentError("File not readable.")
+        except IOError:
+            raise IOError("Movie file not found.")
 
     def __parse_language(self, lang):
         for i in lang.split(','):
@@ -72,7 +260,8 @@ class Subber:
                 raise argparse.ArgumentError(None, 'Unknown language.')
         return lang
 
-    def __parse_preferred(self, pref):
+    @staticmethod
+    def __parse_preferred(pref):
         if pref in ['napi', 'opensubtitles']:
             return pref
         else:
@@ -84,181 +273,105 @@ class Subber:
             raise argparse.ArgumentError(None, "Movie file doesn't exists.")
         return fn
 
-    def _check_napi(self):
-        """Download and validate subtitle from napi projekt. Subtitle is located in temporary location."""
-        d = hashlib.md5()
-        with open(self.filename, mode='br') as f:
-            d.update(f.read(10485760))
-        url = "http://napiprojekt.pl/unit_napisy/dl.php?l=PL&f={}&t={}&v=other&kolejka=false&nick=&pass=&napios={}" \
-            .format(d.hexdigest(), self.__napi_hash(d.hexdigest()), os.name)
+    def handler(self):
+        napi = Napi(self.filename)
         try:
-            u = urllib.request.urlopen(url)
-            c = u.read()
-            code = u.getcode()
-            if code == 200 and c != b'NPc0':
-                open(self.temp_file, "bw").write(c)
-            else:
-                raise ValueError('No napiprojekt subtitle found.')
-        except urllib.error.URLError:
-            return "No Internet connection."
-        except ValueError as e:
-            return str(e)
-
+            open_subtitles = Opensubtitle(self.filename, lang=self.language)
+        except IOError as e:
+            print(str(e))
+            sys.exit()
         try:
-            if os.system('/usr/bin/7z x -y -so -piBlm8NTigvru0Jr0 {} 2>/dev/null >"{}"'.format(
-                    self.temp_file, self.subtitle_temp_path)) == 0:
-                # print('subtitles sucessfully extracted.')
-                os.remove(self.temp_file)
-            else:
-                raise EnvironmentError
-        except EnvironmentError as e:
-            template = 'An exception of type {0} occurred. Arguments:\n{1!r}'
-            return template.format(type(e).__name__, e.args)
-
-        try:
-            lines = [line for line in open(self.subtitle_temp_path, 'r', encoding='cp1250')]
-            os.remove(self.subtitle_temp_path)
-            open(self.subtitle_temp_path, 'w').writelines(lines)
+            r = open_subtitles.identify_movie()
         except Exception as e:
-            template = 'Some errors in encoding, keeping buggy version. ' \
-                       'An exception of type {0} occurred. Arguments:\n{1!r}'
-            message = template.format(type(e).__name__, e.args)
-            return message
-        return 0
-
-    def _check_name_opensubtitles(self):
-        a = self.os_proxy.CheckMovieHash2(self.opensubtitle_token, [self.os_h])
-        if a['status'] == '200 OK':
-            a = a['data'][self.os_h][0]
-            if a['MovieKind'] == 'episode':
-                self.recognized_movie = '{} ({}) S{}E{}'.format(a['MovieName'], a['MovieYear'], a['SeriesSeason'],
-                                                                a['SeriesEpisode'])
-            else:
-                self.recognized_movie = '{} ({})'.format(a['MovieName'], a['MovieYear'])
-
-    def _list_opensubtitles(self):
-        a = self.os_proxy.SearchSubtitles(self.opensubtitle_token,
-                                          [{'sublanguageid': self.language, 'moviehash': self.os_h}])
-        if a['status'] == '200 OK':
-            return a['data']
+            print(str(e))
         else:
-            return None
-
-    def _download_best_opensubtitles(self):
-        l = self._list_opensubtitles()
-        m = time.strptime('1900-01-01 01:01:01', '%Y-%m-%d %H:%M:%S')
-        s = None
-        for i in l:
-            t = time.strptime(i['SubAddDate'], '%Y-%m-%d %H:%M:%S')
-            if t>m:
-                m = t
-                s = i
-        url = s['ZipDownloadLink']
-        print(url)
-        try:
-            u = urllib.request.urlopen(url)
-            c = u.read()
-            code = u.getcode()
-            if code == 200:
-                open(self.temp_file+'os', "bw").write(c)
-                with zipfile.ZipFile(self.temp_file+'os') as myzip:
-                    with myzip.open(s['SubFileName']) as myfile:
-                        c = myfile.read().decode('cp1250')
-                        with open(self.subtitle_temp_path+'os', 'w') as f:
-                            f.write(c)
+            print("\nIdentified as: {}".format(r))
+        os_l = open_subtitles.list_available_subtitles()
+        n_l = napi.list_available_subtitles()
+        if len(os_l) == 0 and len(n_l) == 0:
+            print('No subtitles found for this movie.')
+            sys.exit()
+        if self.selection is False:
+            print('\n\nNapi subtitles found: {}'.format(len(n_l)))
+            print('OpenSubtitle subtitles found: {}'.format(len(os_l)))
+            print("\nPreferred service: {}.".format(self.preferred))
+            in_action = self.preferred
+            try:
+                if n_l == 0 and os_l == 0:
+                    print('No subtitles found.')
+                    sys.exit()
+                elif len(n_l) == 0 and self.preferred == 'napi':
+                    print("Fallback to opensubtitles.")
+                    in_action = 'opensubtitles'
+                    napi.download_and_save()
+                elif len(os_l) == 0 and self.preferred == 'opensubtitles':
+                    print("Fallback to napi.")
+                    in_action = 'napi'
+                    open_subtitles.download_and_save()
+                elif self.preferred == 'download_and_save':
+                    napi.download_and_save()
+                elif self.preferred == 'opensubtitles':
+                    open_subtitles.download_and_save()
+                else:
+                    raise UnboundLocalError
+            except Exception as e:
+                print('Subtitle download from {} failed.'.format(in_action))
+                print(str(e))
+                if in_action == 'napi':
+                    in_action = 'opensubtitles'
+                    print('Retry with {}'.format(in_action))
+                    open_subtitles.download_and_save()
+                elif in_action == 'opensubtitles':
+                    in_action = 'napi'
+                    print('Retry with {}'.format(in_action))
+                    napi.download_and_save()
             else:
-                raise ValueError('Opensubtitle server error.')
-        except urllib.error.URLError:
-            return "No Internet connection."
-        except ValueError as e:
-            return str(e)
+                print('Subtitle downloaded from {}.'.format(in_action))
+        else:
+            # self.selection is True
+            print(os_l)
+            selection = []
+            print('\n\nNapi subtitles found: {}'.format(len(n_l)))
+            if len(n_l) > 0:
+                print('[1] Napi subtitles: {} lines in file'.format(
+                    len(napi.reformat_subtitle(napi.download_subtitle()).split('\n'))))
+                selection.append('napi')
+            print('OpenSubtitle subtitles found: {}'.format(len(os_l)))
+            start = len(selection) + 1
+            for i, x in enumerate(os_l):
+                print('[{}] Opensubtitles, downloads: {}, realease: {}, duration: {}, lang: {}, added: {}, size: {}'
+                      .format(i + start, x['SubDownloadsCnt'], x['MovieReleaseName'], x['SubLastTS'],
+                              x['SubLanguageID'], x['SubAddDate'], x['SubSize']))
+                selection.append(x['ZipDownloadLink'])
+            print('\n')
+            t = True
+            while t:
+                try:
+                    selected = int(input('\nSelect subtitle to download (number):'))
+                    movie_id = selection[selected - 1]
+                    if movie_id == 'napi':
+                        napi.download_and_save()
+                        print('Subtitles successfully downloaded.')
+                        t = False
+                    else:
+                        open_subtitles.download_and_save(movie_id)
+                        t = False
+                except ValueError:
+                    print('invalid subtitle number.')
+                except IndexError:
+                    print('No subtitle with selected number.')
+                except Exception as e:
+                    print(str(e))
+                else:
+                    t = False
 
     @staticmethod
-    def __napi_hash(z):
-        idx = [0xe, 0x3, 0x6, 0x8, 0x2]
-        mul = [2, 2, 5, 4, 3]
-        add = [0, 0xd, 0x10, 0xb, 0x5]
-
-        b = []
-        for i in range(len(idx)):
-            a = add[i]
-            m = mul[i]
-            i = idx[i]
-
-            t = a + int(z[i], 16)
-            v = int(z[t:t + 2], 16)
-            b.append(("%x" % (v * m))[-1])
-        return ''.join(b)
-
-    def __opensubtitles_hash(self):
-        try:
-            longlongformat = '<q'  # little-endian long long
-            bytesize = struct.calcsize(longlongformat)
-
-            with open(self.filename, mode='br') as f:
-                filesize = os.path.getsize(self.filename)
-                h = filesize
-
-                if filesize < 65536 * 2:
-                    return "SizeError"
-
-                for x in range(65536 // bytesize):
-                    buffer = f.read(bytesize)
-                    (l_value,) = struct.unpack(longlongformat, buffer)
-                    h += l_value
-                    h = h & 0xFFFFFFFFFFFFFFFF  # to remain as 64bit number
-
-                f.seek(max(0, filesize - 65536), 0)
-                for x in range(65536 // bytesize):
-                    buffer = f.read(bytesize)
-                    (l_value,) = struct.unpack(longlongformat, buffer)
-                    h += l_value
-                    h = h & 0xFFFFFFFFFFFFFFFF
-
-                f.close()
-                return "%016x" % h
-
-        except IOError:
-            return "IOError"
-
-    def handler(self):
-        self._check_name_opensubtitles()
-        n = self._check_napi()
-
-        print("\nIdentified as: {}".format(self.recognized_movie))
-        if n == 0:
-            print('\nNapi subtitles:\t\t\tfound.')
-        else:
-            print('\n{}'.format(n))
-        l = self._list_opensubtitles()
-        if len(l):
-            print('Opensubtitles subtitles:\tfound.')
-        else:
-            print('Opensubtitles subtitles:\tnot found.')
-
-        print('Preferred: \t\t\t{}'.format(self.preferred))
-        self._download_best_opensubtitles()
-        print('\n\n\n')
-        print()
-
-
-
-
-        pass
+    def exit_info():
+        print(
+            'napi.py uses NapiProjekt Database (http://www.napiprojekt.pl/) and OpenSubtitles Database (https://www.opensubtitles.org/).')
 
 
 if __name__ == '__main__':
+    atexit.register(Subber.exit_info)
     s = Subber()
     s.handler()
-
-    if s.os_proxy:
-        s.os_proxy.LogOut(s.opensubtitle_token)
-        # print(s.filename, s.language, s.verbose, s.subtitle_filename, s.preferred)
-
-        # s._list_opensubtitles()
-
-        # n = s._check_napi()
-        # if n == 0:
-        #     print('napi subs successfully downloaded')
-        # else:
-        #     print('napi failed\n{}'.format(n))
